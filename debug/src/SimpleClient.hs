@@ -33,7 +33,7 @@ runTLS debug ioDebug params hostname portNumber f =
         ctx <- contextNew sock params
         contextHookSetLogging ctx getLogging
         f ctx
-  where getLogging = ioLogging $ packetLogging $ def
+  where getLogging = ioLogging $ packetLogging def
         packetLogging logging
             | debug = logging { loggingPacketSent = putStrLn . ("debug: >> " ++)
                               , loggingPacketRecv = putStrLn . ("debug: << " ++)
@@ -55,7 +55,7 @@ runTLS debug ioDebug params hostname portNumber f =
         teardown sock = close sock
 
 sessionRef ref = SessionManager
-    { sessionEstablish      = \sid sdata -> writeIORef ref (sid,sdata)
+    { sessionEstablish      = curry $ writeIORef ref
     , sessionResume         = \sid       -> readIORef ref >>= \(s,d) -> if s == sid then return (Just d) else return Nothing
     , sessionResumeOnlyOnce = \_         -> fail "sessionResumeOnlyOnce not implemented for simple client"
     , sessionInvalidate     = \_         -> return ()
@@ -124,7 +124,7 @@ getDefaultParams flags host store sStorage certCredsRequest session earlyData =
                 | NoVersionDowngrade `elem` flags = [tlsConnectVer]
                 | otherwise = filter (<= tlsConnectVer) allVers
             allVers = [TLS13, TLS12, TLS11, TLS10, SSL3]
-            validateCert = not (NoValidateCert `elem` flags)
+            validateCert = NoValidateCert `notElem` flags
 
 getGroups flags = case getGroup >>= readGroups of
     Nothing     -> defaultGroups
@@ -229,7 +229,7 @@ runOn (sStorage, certStore) flags port hostname
             loopSendData bytes ctx
                 | bytes <= 0 = return ()
                 | otherwise  = do
-                    sendData ctx $ LC.fromChunks [(if bytes > B.length dataSend then dataSend else BC.take bytes dataSend)]
+                    sendData ctx $ LC.fromChunks [if bytes > B.length dataSend then dataSend else BC.take bytes dataSend]
                     loopSendData (bytes - B.length dataSend) ctx
 
             loopRecvData bytes ctx
@@ -242,7 +242,7 @@ runOn (sStorage, certStore) flags port hostname
             let query = LC.pack (
                         "GET "
                         ++ findURI flags
-                        ++ (if Http11 `elem` flags then (" HTTP/1.1\r\nHost: " ++ hostname) else " HTTP/1.0")
+                        ++ (if Http11 `elem` flags then " HTTP/1.1\r\nHost: " ++ hostname else " HTTP/1.0")
                         ++ userAgent
                         ++ "\r\n\r\n")
             when (Verbose `elem` flags) (putStrLn "sending query:" >> LC.putStrLn query >> putStrLn "")
@@ -268,12 +268,12 @@ runOn (sStorage, certStore) flags port hostname
                     loopRecv out ctx
                 bye ctx `E.catch` \(SomeException e) -> putStrLn $ "bye failed: " ++ show e
                 return ()
-        setup = maybe (return stdout) (flip openFile AppendMode) getOutput
+        setup = maybe (return stdout) (`openFile` AppendMode) getOutput
         teardown out = when (isJust getOutput) $ hClose out
         loopRecv out ctx = do
             d <- timeout (timeoutMs * 1000) (recvData ctx) -- 2s per recv
             case d of
-                Nothing            -> when (Debug `elem` flags) (hPutStrLn stderr "timeout") >> return ()
+                Nothing            -> when (Debug `elem` flags) $ hPutStrLn stderr "timeout"
                 Just b | BC.null b -> return ()
                        | otherwise -> BC.hPutStrLn out b >> loopRecv out ctx
 
@@ -296,7 +296,7 @@ runOn (sStorage, certStore) flags port hostname
         findURI (Uri u:_) = u
         findURI (_:xs)    = findURI xs
 
-        userAgent = maybe "" (\s -> "\r\nUser-Agent: " ++ s) mUserAgent
+        userAgent = maybe "" ("\r\nUser-Agent: " ++) mUserAgent
         mUserAgent = foldl f Nothing flags
           where f _   (UserAgent ua) = Just ua
                 f acc _              = acc
@@ -313,9 +313,7 @@ runOn (sStorage, certStore) flags port hostname
           where f _   (ClientCert c) = Just c
                 f acc _              = acc
         getBenchAmount = foldl f defaultBenchAmount flags
-          where f acc (BenchData am) = case readNumber am of
-                                            Nothing -> acc
-                                            Just i  -> i
+          where f acc (BenchData am) = fromMaybe acc $ readNumber am
                 f acc _              = acc
 
 getTrustAnchors flags = getCertificateStore (foldr getPaths [] flags)
@@ -328,8 +326,8 @@ printUsage =
 main = do
     args <- getArgs
     let (opts,other,errs) = getOpt Permute options args
-    when (not $ null errs) $ do
-        putStrLn $ show errs
+    unless (null errs) $ do
+        print errs
         exitFailure
 
     when (Help `elem` opts) $ do
