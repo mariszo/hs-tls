@@ -9,7 +9,13 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy.Char8 as LC
 import Data.Default.Class
 import Data.IORef
-import Network.Socket (socket, close, connect)
+import Data.X509.CertificateStore (CertificateStore)
+import Network.Socket 
+  (socket, 
+   close, 
+   connect, 
+   PortNumber, 
+   Socket)
 import System.Console.GetOpt
 import System.Environment
 import System.Exit
@@ -23,22 +29,37 @@ import Common
 import HexDump
 import Imports
 
+defaultTimeout, defaultBenchAmount :: Int
 defaultBenchAmount = 1024 * 1024
 defaultTimeout = 2000
 
+bogusCipher :: CipherID -> Cipher
 bogusCipher cid = cipher_AES128_SHA1 { cipherID = cid }
 
+runTLS :: 
+  Bool -> 
+  Bool -> 
+  ClientParams -> 
+  String -> 
+  PortNumber -> 
+  (Context -> IO c) -> 
+  IO c
 runTLS debug ioDebug params hostname portNumber f =
     E.bracket setup teardown $ \sock -> do
         ctx <- contextNew sock params
         contextHookSetLogging ctx getLogging
         f ctx
-  where getLogging = ioLogging $ packetLogging def
+  where getLogging :: Logging
+        getLogging = ioLogging $ packetLogging def
+
+        packetLogging :: Logging -> Logging
         packetLogging logging
             | debug = logging { loggingPacketSent = putStrLn . ("debug: >> " ++)
                               , loggingPacketRecv = putStrLn . ("debug: << " ++)
                               }
             | otherwise = logging
+
+        ioLogging :: Logging -> Logging
         ioLogging logging
             | ioDebug = logging { loggingIOSent = mapM_ putStrLn . hexdump ">>"
                                 , loggingIORecv = \hdr body -> do
@@ -46,14 +67,20 @@ runTLS debug ioDebug params hostname portNumber f =
                                     mapM_ putStrLn $ hexdump "<<" body
                                 }
             | otherwise = logging
+
+        setup :: IO Socket
         setup = do
             ai <- makeAddrInfo (Just hostname) portNumber
             sock <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
             let sockaddr = addrAddress ai
             connect sock sockaddr
             return sock
+
+        teardown :: Socket -> IO ()
         teardown sock = close sock
 
+
+sessionRef :: IORef (SessionID, SessionData) -> SessionManager
 sessionRef ref = SessionManager
     { sessionEstablish      = curry $ writeIORef ref
     , sessionResume         = \sid       -> readIORef ref >>= \(s,d) -> if s == sid then return (Just d) else return Nothing
@@ -61,6 +88,14 @@ sessionRef ref = SessionManager
     , sessionInvalidate     = \_         -> return ()
     }
 
+getDefaultParams ::    [Flag]
+                    -> String
+                    -> CertificateStore
+                    -> IORef (SessionID, SessionData)
+                    -> Maybe OnCertificateRequest
+                    -> Maybe (SessionID, SessionData)
+                    -> Maybe ByteString
+                    -> ClientParams
 getDefaultParams flags host store sStorage certCredsRequest session earlyData =
     (defaultParamsClient serverName BC.empty)
         { clientSupported = def { supportedVersions = supportedVers
@@ -82,14 +117,18 @@ getDefaultParams flags host store sStorage certCredsRequest session earlyData =
         , clientEarlyData = earlyData
         }
     where
+            serverName :: String
             serverName = foldl f host flags
               where f _   (SNI n) = n
                     f acc _       = acc
 
+            validateCache :: ValidationCache
             validateCache
                 | validateCert = def
                 | otherwise    = ValidationCache (\_ _ _ -> return ValidationCachePass)
                                                  (\_ _ _ -> return ())
+
+            myCiphers :: [Cipher]
             myCiphers = foldl accBogusCipher getSelectedCiphers flags
               where accBogusCipher acc (BogusCipher c) =
                         case reads c of
@@ -97,6 +136,7 @@ getDefaultParams flags host store sStorage certCredsRequest session earlyData =
                             _         -> acc
                     accBogusCipher acc _ = acc
 
+            getUsedCipherIDs :: [CipherID]
             getUsedCipherIDs = foldl f [] flags
               where f acc (UseCipher am) =
                             case readCiphers am of
@@ -104,6 +144,7 @@ getDefaultParams flags host store sStorage certCredsRequest session earlyData =
                                 Nothing -> acc
                     f acc _ = acc
 
+            getSelectedCiphers :: [Cipher]
             getSelectedCiphers =
                 case getUsedCipherIDs of
                     [] -> ciphersuite_all
@@ -113,6 +154,7 @@ getDefaultParams flags host store sStorage certCredsRequest session earlyData =
             getDebugSeed _   (DebugSeed seed) = seedFromInteger `fmap` readNumber seed
             getDebugSeed acc _                = acc
 
+            tlsConnectVer :: Version
             tlsConnectVer
                 | Tls13 `elem` flags = TLS13
                 | Tls12 `elem` flags = TLS12
@@ -120,18 +162,28 @@ getDefaultParams flags host store sStorage certCredsRequest session earlyData =
                 | Ssl3  `elem` flags = SSL3
                 | Tls10 `elem` flags = TLS10
                 | otherwise          = TLS13
+
+            supportedVers :: [Version]
             supportedVers
                 | NoVersionDowngrade `elem` flags = [tlsConnectVer]
                 | otherwise = filter (<= tlsConnectVer) allVers
+
+            allVers :: [Version]
             allVers = [TLS13, TLS12, TLS11, TLS10, SSL3]
+
+            validateCert :: Bool
             validateCert = NoValidateCert `notElem` flags
 
+getGroups :: [Flag] -> [Group]
 getGroups flags = case getGroup >>= readGroups of
     Nothing     -> defaultGroups
     Just []     -> defaultGroups
     Just groups -> groups
   where
+    defaultGroups :: [Group]
     defaultGroups = supportedGroups def
+
+    getGroup :: Maybe String
     getGroup = foldl f Nothing flags
       where f _   (Group g)  = Just g
             f acc _          = acc
@@ -199,8 +251,11 @@ options =
     , Option []     ["debug-print-seed"] (NoArg DebugPrintSeed) "debug: set a specific seed for randomness"
     ]
 
-noSession = Nothing
 
+noSession :: Maybe a
+noSession = Nothing
+          
+runOn :: (IORef (SessionID, SessionData), CertificateStore) -> [Flag] -> PortNumber -> [Char] -> IO ()
 runOn (sStorage, certStore) flags port hostname
     | BenchSend `elem` flags = runBench True
     | BenchRecv `elem` flags = runBench False
@@ -215,6 +270,7 @@ runOn (sStorage, certStore) flags port hostname
               Just i  -> Just <$> B.readFile i
             doTLS certCredRequest (Just session) earlyData `E.catch` \(SomeException e) -> print e
   where
+        runBench :: Bool -> IO ()
         runBench isSend =
             runTLS (Debug `elem` flags)
                    (IODebug `elem` flags)
@@ -225,19 +281,26 @@ runOn (sStorage, certStore) flags port hostname
                     else loopRecvData getBenchAmount ctx
                 bye ctx
           where
+            dataSend :: ByteString
             dataSend = BC.replicate 4096 'a'
+
+            loopSendData :: Int -> Context -> IO ()
             loopSendData bytes ctx
                 | bytes <= 0 = return ()
                 | otherwise  = do
                     sendData ctx $ LC.fromChunks [if bytes > B.length dataSend then dataSend else BC.take bytes dataSend]
                     loopSendData (bytes - B.length dataSend) ctx
 
+            loopRecvData :: Int -> Context -> IO ()
             loopRecvData bytes ctx
                 | bytes <= 0 = return ()
                 | otherwise  = do
                     d <- recvData ctx
                     loopRecvData (bytes - B.length d) ctx
 
+        doTLS :: Maybe OnCertificateRequest
+                  -> Maybe (SessionID, SessionData) 
+                  -> Maybe ByteString -> IO ()
         doTLS certCredRequest sess earlyData = E.bracket setup teardown $ \out -> do
             let query = LC.pack (
                         "GET "
@@ -260,16 +323,22 @@ runOn (sStorage, certStore) flags port hostname
                                 putStrLn "Resending 0RTT data ..."
                                 sendData ctx $ LC.fromStrict edata
                     _ -> return ()
-                sendData ctx $ query
+                sendData ctx query
                 loopRecv out ctx
                 when (UpdateKey `elem` flags) $ do
                     _tls13 <- updateKey ctx TwoWay
-                    sendData ctx $ query
+                    sendData ctx query
                     loopRecv out ctx
                 bye ctx `E.catch` \(SomeException e) -> putStrLn $ "bye failed: " ++ show e
                 return ()
+
+        setup :: IO Handle
         setup = maybe (return stdout) (`openFile` AppendMode) getOutput
+
+        teardown :: Handle -> IO ()
         teardown out = when (isJust getOutput) $ hClose out
+
+        loopRecv :: Handle -> Context -> IO ()
         loopRecv out ctx = do
             d <- timeout (timeoutMs * 1000) (recvData ctx) -- 2s per recv
             case d of
@@ -277,6 +346,7 @@ runOn (sStorage, certStore) flags port hostname
                 Just b | BC.null b -> return ()
                        | otherwise -> BC.hPutStrLn out b >> loopRecv out ctx
 
+        getCredRequest :: IO (Maybe (a -> IO (Maybe Credential)))
         getCredRequest =
             case clientCert of
                 Nothing -> return Nothing
@@ -292,59 +362,74 @@ runOn (sStorage, certStore) flags port hostname
                                     return $ Just certRequest
                         (_   ,_)      -> error "wrong format for client-cert, expecting 'cert-file:key-file'"
 
+        findURI :: [Flag] -> String
         findURI []        = "/"
         findURI (Uri u:_) = u
         findURI (_:xs)    = findURI xs
 
+
+        userAgent :: String
         userAgent = maybe "" ("\r\nUser-Agent: " ++) mUserAgent
+
+        mUserAgent :: Maybe String
         mUserAgent = foldl f Nothing flags
           where f _   (UserAgent ua) = Just ua
                 f acc _              = acc
+
+        getInput :: Maybe String
         getInput = foldl f Nothing flags
           where f _   (Input i)  = Just i
                 f acc _          = acc
+
+        getOutput :: Maybe String
         getOutput = foldl f Nothing flags
           where f _   (Output o) = Just o
                 f acc _          = acc
+
+        timeoutMs :: Int
         timeoutMs = foldl f defaultTimeout flags
           where f _   (Timeout t) = read t
                 f acc _           = acc
+
+        clientCert :: Maybe String
         clientCert = foldl f Nothing flags
           where f _   (ClientCert c) = Just c
                 f acc _              = acc
+
+        getBenchAmount :: Int
         getBenchAmount = foldl f defaultBenchAmount flags
           where f acc (BenchData am) = fromMaybe acc $ readNumber am
                 f acc _              = acc
 
+getTrustAnchors :: [Flag] -> IO CertificateStore
 getTrustAnchors flags = getCertificateStore (foldr getPaths [] flags)
   where getPaths (TrustAnchor path) acc = path : acc
         getPaths _                  acc = acc
 
+printUsage :: IO ()
 printUsage =
     putStrLn $ usageInfo "usage: simpleclient [opts] <hostname> [port]\n\n\t(port default to: 443)\noptions:\n" options
 
+main :: IO ()
 main = do
     args <- getArgs
     let (opts,other,errs) = getOpt Permute options args
     unless (null errs) $ do
         print errs
         exitFailure
-
     when (Help `elem` opts) $ do
         printUsage
         exitSuccess
-
     when (ListCiphers `elem` opts) $ do
         printCiphers
         exitSuccess
-
     when (ListGroups `elem` opts) $ do
         printGroups
         exitSuccess
-
     certStore <- getTrustAnchors opts
     sStorage <- newIORef (error "storage ioref undefined")
     case other of
         [hostname]      -> runOn (sStorage, certStore) opts 443 hostname
         [hostname,port] -> runOn (sStorage, certStore) opts (fromInteger $ read port) hostname
         _               -> printUsage >> exitFailure
+

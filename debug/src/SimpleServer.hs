@@ -25,22 +25,32 @@ import Network.TLS.Extra.Cipher
 import Common
 import HexDump
 import Imports
+import Text.Read (Lexeme(String))
 
+defaultBenchAmount, defaultTimeout :: Int
 defaultBenchAmount = 1024 * 1024
 defaultTimeout = 2000
 
+bogusCipher :: CipherID -> Cipher
 bogusCipher cid = cipher_AES128_SHA1 { cipherID = cid }
 
+runTLS :: Bool -> Bool -> ServerParams -> S.Socket -> (Context -> IO b) -> IO b
 runTLS debug ioDebug params cSock f = do
     ctx <- contextNew cSock params
     contextHookSetLogging ctx getLogging
     f ctx
-  where getLogging = ioLogging $ packetLogging def
+  where 
+        getLogging :: Logging
+        getLogging = ioLogging $ packetLogging def
+
+        packetLogging :: Logging -> Logging
         packetLogging logging
             | debug = logging { loggingPacketSent = putStrLn . ("debug: >> " ++)
                               , loggingPacketRecv = putStrLn . ("debug: << " ++)
                               }
             | otherwise = logging
+
+        ioLogging :: Logging -> Logging
         ioLogging logging
             | ioDebug = logging { loggingIOSent = mapM_ putStrLn . hexdump ">>"
                                 , loggingIORecv = \hdr body -> do
@@ -77,11 +87,14 @@ getDefaultParams flags store smgr cred rtt0accept = do
         , serverEarlyDataSize = if rtt0accept then 2048 else 0
         }
     where
+
+            validateCache :: ValidationCache
             validateCache
                 | validateCert = def
                 | otherwise    = ValidationCache (\_ _ _ -> return ValidationCachePass)
                                                  (\_ _ _ -> return ())
 
+            myCiphers :: [Cipher]
             myCiphers = foldl accBogusCipher getSelectedCiphers flags
               where accBogusCipher acc (BogusCipher c) =
                         case reads c of
@@ -89,6 +102,7 @@ getDefaultParams flags store smgr cred rtt0accept = do
                             _         -> acc
                     accBogusCipher acc _ = acc
 
+            getUsedCipherIDs :: [CipherID]
             getUsedCipherIDs = foldl f [] flags
               where f acc (UseCipher am) =
                             case readCiphers am of
@@ -96,11 +110,13 @@ getDefaultParams flags store smgr cred rtt0accept = do
                                 Nothing -> acc
                     f acc _ = acc
 
+            getSelectedCiphers :: [Cipher]
             getSelectedCiphers =
                 case getUsedCipherIDs of
                     [] -> ciphersuite_default
                     l  -> mapMaybe (\cid -> find ((== cid) . cipherID) ciphersuite_all) l
 
+            getDHParams :: [Flag] -> Maybe String
             getDHParams opts = foldl accf Nothing opts
               where accf _   (DHParams file) = Just file
                     accf acc _               = acc
@@ -109,6 +125,7 @@ getDefaultParams flags store smgr cred rtt0accept = do
             getDebugSeed _   (DebugSeed seed) = seedFromInteger `fmap` readNumber seed
             getDebugSeed acc _                = acc
 
+            tlsConnectVer :: Version
             tlsConnectVer
                 | Tls13 `elem` flags = TLS13
                 | Tls12 `elem` flags = TLS12
@@ -116,19 +133,31 @@ getDefaultParams flags store smgr cred rtt0accept = do
                 | Ssl3  `elem` flags = SSL3
                 | Tls10 `elem` flags = TLS10
                 | otherwise          = TLS13
+
+            supportedVers :: [Version]
             supportedVers
                 | NoVersionDowngrade `elem` flags = [tlsConnectVer]
                 | otherwise = filter (<= tlsConnectVer) allVers
+
+            allVers :: [Version]
             allVers = [TLS13, TLS12, TLS11, TLS10, SSL3]
+
+            validateCert :: Bool
             validateCert = NoValidateCert `notElem` flags
+
+            allowRenegotiation :: Bool
             allowRenegotiation = AllowRenegotiation `elem` flags
 
+getGroups :: [Flag] -> [Group]
 getGroups flags = case getGroup >>= readGroups of
     Nothing     -> defaultGroups
     Just []     -> defaultGroups
     Just groups -> groups
   where
+    defaultGroups :: [Group]
     defaultGroups = supportedGroups def
+
+    getGroup :: Maybe String
     getGroup = foldl f Nothing flags
       where f _   (Group g)  = Just g
             f acc _          = acc
@@ -193,6 +222,7 @@ options =
     , Option []     ["dhparams"] (ReqArg DHParams "dhparams") "DH parameters (name or file)"
     ]
 
+loadCred :: Maybe FilePath -> Maybe FilePath -> IO Credential
 loadCred (Just key) (Just cert) = do
     res <- credentialLoadX509 cert key
     case res of
@@ -203,6 +233,7 @@ loadCred Nothing _ =
 loadCred _       Nothing =
     error "missing credential certificate"
 
+runOn :: (SessionManager, CertificateStore) -> [Flag] -> S.PortNumber -> IO ()
 runOn (sStorage, certStore) flags port = do
     ai <- makeAddrInfo Nothing port
     sock <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
@@ -213,6 +244,7 @@ runOn (sStorage, certStore) flags port = do
     runOn' sock
     close sock
   where
+        runOn' :: S.Socket -> IO ()
         runOn' sock
           | BenchSend `elem` flags = runBench True sock
           | BenchRecv `elem` flags = runBench False sock
@@ -221,6 +253,8 @@ runOn (sStorage, certStore) flags port = do
               E.bracket (maybe (return stdout) (`openFile` AppendMode) getOutput)
                         (when (isJust getOutput) . hClose)
                         (doTLS sock)
+
+        runBench :: Bool -> S.Socket -> IO ()
         runBench isSend sock = do
             (cSock, cAddr) <- accept sock
             putStrLn ("connection from " ++ show cAddr)
@@ -234,19 +268,24 @@ runOn (sStorage, certStore) flags port = do
                 bye ctx
               `E.finally` close cSock
           where
+            dataSend :: ByteString
             dataSend = BC.replicate 4096 'a'
+
+            loopSendData :: Int -> Context -> IO ()
             loopSendData bytes ctx
                 | bytes <= 0 = return ()
                 | otherwise  = do
                     sendData ctx $ LC.fromChunks [if bytes > B.length dataSend then dataSend else BC.take bytes dataSend]
                     loopSendData (bytes - B.length dataSend) ctx
 
+            loopRecvData :: Int -> Context -> IO ()
             loopRecvData bytes ctx
                 | bytes <= 0 = return ()
                 | otherwise  = do
                     d <- recvData ctx
                     loopRecvData (bytes - B.length d) ctx
 
+        doTLS :: S.Socket -> Handle -> IO ()
         doTLS sock out = do
             (cSock, cAddr) <- accept sock
             putStrLn ("connection from " ++ show cAddr)
@@ -268,6 +307,7 @@ runOn (sStorage, certStore) flags port = do
                   `E.finally` close cSock
             doTLS sock out
 
+        loopRecv :: Handle -> Context -> IO ()
         loopRecv out ctx = do
             d <- timeout (timeoutMs * 1000) (recvData ctx) -- 2s per recv
             case d of
@@ -292,29 +332,41 @@ runOn (sStorage, certStore) flags port = do
                         (_   ,_)      -> error "wrong format for client-cert, expecting 'cert-file:key-file'"
 -}
 
+        getOutput :: Maybe String
         getOutput = foldl f Nothing flags
           where f _   (Output o) = Just o
                 f acc _          = acc
+
+        timeoutMs :: Int
         timeoutMs = foldl f defaultTimeout flags
           where f _   (Timeout t) = read t
                 f acc _           = acc
+
+        getKey :: Maybe String
         getKey = foldl f Nothing flags
           where f _   (Key key) = Just key
                 f acc _         = acc
+
+        getCertificate :: Maybe String
         getCertificate = foldl f Nothing flags
           where f _   (Certificate cert) = Just cert
                 f acc _                  = acc
+
+        getBenchAmount :: Int
         getBenchAmount = foldl f defaultBenchAmount flags
           where f acc (BenchData am) = fromMaybe acc $ readNumber am
                 f acc _              = acc
 
+getTrustAnchors :: [Flag] -> IO CertificateStore
 getTrustAnchors flags = getCertificateStore (foldr getPaths [] flags)
   where getPaths (TrustAnchor path) acc = path : acc
         getPaths _                  acc = acc
 
+printUsage :: IO ()
 printUsage =
     putStrLn $ usageInfo "usage: simpleserver [opts] [port]\n\n\t(port default to: 443)\noptions:\n" options
 
+main :: IO ()
 main = do
     args <- getArgs
     let (opts,other,errs) = getOpt Permute options args
@@ -344,3 +396,4 @@ main = do
         []     -> runOn (sStorage, certStore) opts 443
         [port] -> runOn (sStorage, certStore) opts (fromInteger $ read port)
         _      -> printUsage >> exitFailure
+
